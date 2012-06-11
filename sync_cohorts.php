@@ -26,6 +26,9 @@
  * # 5 minutes past 4am
  * 5 4 * * * $sudo -u www-data /usr/bin/php /var/www/moodle/auth/cas/cli/sync_cohorts.php
  *
+ * Sample cron entry mc:
+ * # 5 minutes past 4am
+ * 5 4 * * * su --shell=/bin/bash --session-command="/usr/bin/php /var/www/moodle/auth/cas/cli/sync_cohorts.php" apache &
  * Notes:
  *   - it is required to use the web server account when executing PHP CLI scripts
  *   - you need to change the "www-data" to match the apache user account
@@ -47,6 +50,11 @@
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 
+ /***** ADD to config mc:
+$CFG->ldap_group_class = 'posixGroup';
+$CFG->ldap_group_contexts = 'ou=cohort,ou=moodle,dc=college,dc=edu'; // <-- example
+***************/
+ 
 define('CLI_SCRIPT', true);
 
 require (dirname(dirname(dirname(dirname(__FILE__)))) . '/config.php');
@@ -75,8 +83,6 @@ class auth_plugin_cohort extends auth_plugin_ldap {
         //TODO must be in some setting screen Currently in config.php
         $this->config->group_attribute = !empty($CFG->ldap_group_attribute)?$CFG->ldap_group_attribute:'cn';
         $this->config->group_class = !empty($CFG->ldap_group_class )?$CFG->ldap_group_class :'groupOfUniqueNames';
-
-        // print_r($this->config);
     }
 
     /**
@@ -91,13 +97,13 @@ class auth_plugin_cohort extends auth_plugin_ldap {
 
         print_string('connectingldap', 'auth_ldap');
         $ldapconnection = $this->ldap_connect();
-
         $fresult = array ();
 
         if ($filter == "*") {
             $filter = "(&(" . $this->config->group_attribute . "=*)(objectclass=" . $this->config->group_class . "))";
         }
 
+        $this->config->contexts = !empty($CFG->ldap_group_contexts )?$CFG->ldap_group_contexts : $this->config->contexts;    
         $contexts = explode(';', $this->config->contexts);
         if (!empty ($this->config->create_context)) {
             array_push($contexts, $this->config->create_context);
@@ -129,10 +135,70 @@ class auth_plugin_cohort extends auth_plugin_ldap {
             }
         }
         $this->ldap_close();
+        // Debug
+        //print "filter att ". ($filter) . "\n";
+        //print "group att ". ($this->config->group_attribute) . "\n";
+        //print_r($this->config->contexts);
+        //print_r($fresult);
+        //die();
         return $fresult;
     }
 
     /**
+     * serach for group members on a openLDAP directory
+     * return string[] array of usernames
+     */
+
+    function ldap_get_group_members_mc($group) {
+        global $CFG;
+
+        $ret = array ();
+        $ldapconnection = $this->ldap_connect();
+
+        $textlib = textlib_get_instance();
+        $group = $textlib->convert($group, 'utf-8', $this->config->ldapencoding);
+
+        if ($CFG->debug_ldap_groupes)
+            print_object("connexion ldap: ", $ldapconnection);
+        if (!$ldapconnection)
+            return $ret;
+
+        $queryg = "(&(cn=" . trim($group) . ")(objectClass={$this->config->group_class}))";
+        if ($CFG->debug_ldap_groupes)
+            print_object("queryg: ", $queryg);
+            
+        $this->config->contexts = !empty($CFG->ldap_group_contexts )?$CFG->ldap_group_contexts : $this->config->contexts;  
+        $contexts = explode(';', $this->config->contexts);
+        if (!empty ($this->config->create_context)) {
+            array_push($contexts, $this->config->create_context);
+        }
+
+        foreach ($contexts as $context) {
+            $context = trim($context);
+            if (empty ($context)) {
+                continue;
+            }
+
+            $resultg = ldap_search($ldapconnection, $context, $queryg);
+
+            if (!empty ($resultg) AND ldap_count_entries($ldapconnection, $resultg)) {
+                $groupe = ldap_get_entries($ldapconnection, $resultg);
+                if ($CFG->debug_ldap_groupes)
+                    print_object("groupe: ", $groupe);
+                if (count($groupe[0]['memberuid']) > 0) {
+                    $ret = $groupe[0]['memberuid'];
+                }      
+                    print (count($groupe[0]['memberuid']));
+            }
+        }
+        if ($CFG->debug_ldap_groupes)
+            print_object("retour get_g_m ", $ret);
+        $this->ldap_close();
+        //die();
+        return $ret;
+    }
+
+   /**
      * serach for group members on a openLDAP directory
      * return string[] array of usernames
      */
@@ -247,7 +313,7 @@ class auth_plugin_cohort extends auth_plugin_ldap {
 
         $size = 999;
 
-
+        $this->config->contexts = !empty($CFG->ldap_group_contexts )?$CFG->ldap_group_contexts : $this->config->contexts;  
         $contexts = explode(';', $this->config->contexts);
         if (!empty ($this->config->create_context)) {
             array_push($contexts, $this->config->create_context);
@@ -350,7 +416,8 @@ class auth_plugin_cohort extends auth_plugin_ldap {
         if ($this->config->user_type == "ad")
             $members = $this->ldap_get_group_members_ad($groupe);
         else
-            $members = $this->ldap_get_group_members_rfc($groupe);
+            //$members = $this->ldap_get_group_members_rfc($groupe); // kero
+            $members = $this->ldap_get_group_members_mc($groupe);
         $ret = array ();
         foreach ($members as $member) {
             $params = array (
@@ -359,6 +426,7 @@ class auth_plugin_cohort extends auth_plugin_ldap {
             if ($user = $DB->get_record('user', $params, 'id,username'))
                 $ret[$user->id] = $user->username;
         }
+
         return $ret;
     }
 
@@ -385,6 +453,7 @@ class auth_plugin_cohort extends auth_plugin_ldap {
 
 // Ensure errors are well explained
 $CFG->debug = DEBUG_NORMAL;
+$CFG->debug_ldap_groupes=false; // line to add 
 
 if (!is_enabled_auth('cas')) {
     error_log('[AUTH CAS] ' . get_string('pluginnotenabled', 'auth_ldap'));
@@ -406,7 +475,7 @@ foreach ($ldap_groups as $group=>$groupname) {
         $cohort->name = $cohort->idnumber = $groupname;
         $cohort->contextid = get_system_context()->id;
         //$cohort->component='sync_ldap'; 
-        $cohort->description='cohorte synchronisée avec notre LDAP';
+        $cohort->description='cohort synchronized with our LDAP';
         $cohortid = cohort_add_cohort($cohort);
         print "creation cohorte " . $group . "\n";
 
